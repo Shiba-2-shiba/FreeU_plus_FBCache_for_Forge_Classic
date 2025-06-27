@@ -229,7 +229,7 @@ class IntegratedUtilsScript(scripts.Script):
         self.freeu_params_ui = {}
     
     def title(self):
-        return "Integrated Utilities (FBCache + FreeU)"
+        return "FBCache + FreeU"
 
     def show(self, is_img2img):
         return scripts.AlwaysVisible
@@ -262,20 +262,20 @@ class IntegratedUtilsScript(scripts.Script):
                     with gr.Tabs():
                         with gr.TabItem("First Pass"):
                             fb_enabled_first = gr.Checkbox(label="Enable for First Pass", value=False)
-                            fb_threshold_first = gr.Slider(label="Similarity Threshold", minimum=0.001, maximum=0.5, step=0.001, value=0.1)
+                            fb_threshold_first = gr.Slider(label="Similarity Threshold", minimum=0.001, maximum=0.5, step=0.001, value=0.3)
                             fb_blocks_first = gr.Slider(label="UNet Initial Blocks to Cache", minimum=1, maximum=4, step=1, value=3)
-                            fb_start_first = gr.Slider(label="Start At % of Steps", minimum=0.0, maximum=1.0, step=0.01, value=0.0)
-                            fb_end_first = gr.Slider(label="End At % of Steps", minimum=0.0, maximum=1.0, step=0.01, value=1.0)
+                            fb_start_first = gr.Slider(label="Start At % of Steps", minimum=0.0, maximum=1.0, step=0.01, value=0.3)
+                            fb_end_first = gr.Slider(label="End At % of Steps", minimum=0.0, maximum=1.0, step=0.01, value=0.99)
                             fb_max_hits_first = gr.Number(label="Max Consecutive Hits (-1 for unlimited)", value=-1, precision=0)
                             ui_components.extend([fb_enabled_first, fb_threshold_first, fb_blocks_first, fb_start_first, fb_end_first, fb_max_hits_first])
                         with gr.TabItem("Hires Fix Pass"):
                             fb_enabled_hires = gr.Checkbox(label="Enable for Hires Fix Pass", value=False)
                             fb_use_first_settings = gr.Checkbox(label="Use First Pass settings", value=True)
                             with gr.Group(visible=False) as hires_specific_settings:
-                                fb_threshold_hires = gr.Slider(label="Similarity Threshold (Hires)", minimum=0.001, maximum=0.5, step=0.001, value=0.1)
+                                fb_threshold_hires = gr.Slider(label="Similarity Threshold (Hires)", minimum=0.001, maximum=0.5, step=0.001, value=0.3)
                                 fb_blocks_hires = gr.Slider(label="UNet Initial Blocks (Hires)", minimum=1, maximum=4, step=1, value=3)
-                                fb_start_hires = gr.Slider(label="Start At % of Steps (Hires)", minimum=0.0, maximum=1.0, step=0.01, value=0.0)
-                                fb_end_hires = gr.Slider(label="End At % of Steps (Hires)", minimum=0.0, maximum=1.0, step=0.01, value=1.0)
+                                fb_start_hires = gr.Slider(label="Start At % of Steps (Hires)", minimum=0.0, maximum=1.0, step=0.01, value=0.3)
+                                fb_end_hires = gr.Slider(label="End At % of Steps (Hires)", minimum=0.0, maximum=1.0, step=0.01, value=0.99)
                                 fb_max_hits_hires = gr.Number(label="Max Consecutive Hits (Hires)", value=-1, precision=0)
                             ui_components.extend([fb_enabled_hires, fb_use_first_settings, fb_threshold_hires, fb_blocks_hires, fb_start_hires, fb_end_hires, fb_max_hits_hires])
                     
@@ -285,12 +285,12 @@ class IntegratedUtilsScript(scripts.Script):
                 with gr.TabItem("FreeU"):
                     gr.Markdown("U-Netのバックボーンとスキップ接続の特徴量を調整し、生成品質を向上させます。")
                     freeu_enabled = gr.Checkbox(label="Enable FreeU", value=False)
-                    freeu_b1 = gr.Slider(label="Backbone 1 (b1)", minimum=0, maximum=2, step=0.01, value=1.01)
-                    freeu_b2 = gr.Slider(label="Backbone 2 (b2)", minimum=0, maximum=2, step=0.01, value=1.02)
-                    freeu_s1 = gr.Slider(label="Skip 1 (s1)", minimum=0, maximum=4, step=0.01, value=0.99)
-                    freeu_s2 = gr.Slider(label="Skip 2 (s2)", minimum=0, maximum=4, step=0.01, value=0.95)
-                    freeu_start_at = gr.Slider(label="Start At % of Steps", minimum=0.0, maximum=1.0, step=0.01, value=0.0)
-                    freeu_stop_at = gr.Slider(label="Stop At % of Steps", minimum=0.0, maximum=1.0, step=0.01, value=1.0)
+                    freeu_b1 = gr.Slider(label="Backbone 1 (b1)", minimum=0, maximum=2, step=0.01, value=1.3)
+                    freeu_b2 = gr.Slider(label="Backbone 2 (b2)", minimum=0, maximum=2, step=0.01, value=1.4)
+                    freeu_s1 = gr.Slider(label="Skip 1 (s1)", minimum=0, maximum=4, step=0.01, value=1.2)
+                    freeu_s2 = gr.Slider(label="Skip 2 (s2)", minimum=0, maximum=4, step=0.01, value=0.7)
+                    freeu_start_at = gr.Slider(label="Start At % of Steps", minimum=0.0, maximum=1.0, step=0.01, value=0.01)
+                    freeu_stop_at = gr.Slider(label="Stop At % of Steps", minimum=0.0, maximum=1.0, step=0.01, value=0.2)
                     ui_components.extend([freeu_enabled, freeu_b1, freeu_b2, freeu_s1, freeu_s2, freeu_start_at, freeu_stop_at])
 
         return ui_components
