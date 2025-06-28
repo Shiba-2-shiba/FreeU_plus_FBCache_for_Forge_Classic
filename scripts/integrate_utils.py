@@ -3,11 +3,10 @@
 # FBCacheとFreeUを統合し、単一のパッチで両機能を制御するスクリプト。
 #
 # 改修履歴:
-# - v3.4 (Global Patch Version):
-#   - パッチが他の拡張機能によって上書きされる問題を解決するため、グローバル・モンキーパッチ方式に変更。
-#     - UNetModelクラスのforwardメソッドを直接書き換えることで、実行順序に依存せず機能することを保証。
-#   - processでパッチを適用し、postprocessで確実に元のメソッドに戻すようにライフサイクルを管理。
-#   - 実行時のパラメータをスクリプトのクラスインスタンス経由でパッチ関数に渡すように変更。
+# - v3.6 (Argument Fix Version):
+#   - Hires. fix有効時にNameErrorが発生する問題を修正。
+#   - uiメソッドで定義したGradioコンポーネントのリストと、processメソッドの引数リストを完全に一致させ、
+#     引数のずれを解消した。
 
 import torch
 import gradio as gr
@@ -94,7 +93,6 @@ class IntegratedUtilsScript(scripts.Script):
         print(f"{self._log_prefix()} ERROR: {message}\n{traceback.format_exc()}")
         
     def ui(self, is_img2img):
-        # UI部分は変更なし
         ui_components = []
         with gr.Accordion(self.title(), open=False):
             with gr.Row():
@@ -103,13 +101,30 @@ class IntegratedUtilsScript(scripts.Script):
 
             with gr.Tabs():
                 with gr.TabItem("First Block Cache"):
-                    fb_enabled_first = gr.Checkbox(label="Enable for First Pass", value=False)
-                    fb_threshold_first = gr.Slider(label="Similarity Threshold", minimum=0.001, maximum=0.5, step=0.001, value=0.3)
-                    fb_blocks_first = gr.Slider(label="UNet Initial Blocks to Cache", minimum=1, maximum=4, step=1, value=3)
-                    fb_start_first = gr.Slider(label="Start At % of Steps", minimum=0.0, maximum=1.0, step=0.01, value=0.3)
-                    fb_end_first = gr.Slider(label="End At % of Steps", minimum=0.0, maximum=1.0, step=0.01, value=0.99)
-                    fb_max_hits_first = gr.Number(label="Max Consecutive Hits (-1 for unlimited)", value=-1, precision=0)
-                    ui_components.extend([fb_enabled_first, fb_threshold_first, fb_blocks_first, fb_start_first, fb_end_first, fb_max_hits_first])
+                    with gr.Tabs():
+                        with gr.TabItem("First Pass"):
+                            fb_enabled_first = gr.Checkbox(label="Enable for First Pass", value=False)
+                            fb_threshold_first = gr.Slider(label="Similarity Threshold", minimum=0.001, maximum=0.5, step=0.001, value=0.3)
+                            fb_blocks_first = gr.Slider(label="UNet Initial Blocks to Cache", minimum=1, maximum=4, step=1, value=3)
+                            fb_start_first = gr.Slider(label="Start At % of Steps", minimum=0.0, maximum=1.0, step=0.01, value=0.3)
+                            fb_end_first = gr.Slider(label="End At % of Steps", minimum=0.0, maximum=1.0, step=0.01, value=0.99)
+                            fb_max_hits_first = gr.Number(label="Max Consecutive Hits (-1 for unlimited)", value=-1, precision=0)
+                            ui_components.extend([fb_enabled_first, fb_threshold_first, fb_blocks_first, fb_start_first, fb_end_first, fb_max_hits_first])
+                        
+                        with gr.TabItem("Hires Fix Pass"):
+                            fb_enabled_hires = gr.Checkbox(label="Enable for Hires Fix Pass", value=False)
+                            fb_use_first_settings = gr.Checkbox(label="Use First Pass settings", value=True)
+                            with gr.Group(visible=False) as hires_specific_settings:
+                                fb_threshold_hires = gr.Slider(label="Similarity Threshold (Hires)", minimum=0.001, maximum=0.5, step=0.001, value=0.3)
+                                fb_blocks_hires = gr.Slider(label="UNet Initial Blocks (Hires)", minimum=1, maximum=4, step=1, value=3)
+                                fb_start_hires = gr.Slider(label="Start At % of Steps (Hires)", minimum=0.0, maximum=1.0, step=0.01, value=0.3)
+                                fb_end_hires = gr.Slider(label="End At % of Steps (Hires)", minimum=0.0, maximum=1.0, step=0.01, value=0.99)
+                                fb_max_hits_hires = gr.Number(label="Max Consecutive Hits (Hires)", value=-1, precision=0)
+                            ui_components.extend([fb_enabled_hires, fb_use_first_settings, fb_threshold_hires, fb_blocks_hires, fb_start_hires, fb_end_hires, fb_max_hits_hires])
+                    
+                    def toggle_hires_visibility(use_first): return gr.update(visible=not use_first)
+                    fb_use_first_settings.change(fn=toggle_hires_visibility, inputs=[fb_use_first_settings], outputs=[hires_specific_settings])
+
                 with gr.TabItem("FreeU"):
                     freeu_enabled = gr.Checkbox(label="Enable FreeU", value=False)
                     freeu_b1 = gr.Slider(label="Backbone 1 (b1)", minimum=0, maximum=2, step=0.01, value=1.3)
@@ -138,28 +153,41 @@ class IntegratedUtilsScript(scripts.Script):
                         visited_ids.add(id(inner_obj)); q.append((inner_obj, depth + 1))
         return None
 
-    def process(self, p, enable_debug_logging,
+    # ★★★ 修正点: processメソッドの引数をUIコンポーネントのリストと完全に一致させる ★★★
+    def process(self, p, 
+                # Debug
+                enable_debug_logging,
+                # FBCache First Pass
                 fb_enabled_first, fb_threshold_first, fb_blocks_first, fb_start_first, fb_end_first, fb_max_hits_first,
+                # FBCache Hires Pass
+                fb_enabled_hires, fb_use_first_settings, fb_threshold_hires, fb_blocks_hires, fb_start_hires, fb_end_hires, fb_max_hits_hires,
+                # FreeU
                 freeu_enabled, freeu_b1, freeu_b2, freeu_s1, freeu_s2, freeu_start_at, freeu_stop_at
                 ):
         self.is_debug_logging_enabled = enable_debug_logging
         self.active_fb_state_object = None
+        self.log_info("New generation process started. State has been reset.")
 
-        # Hires Fixは現在サポート外としてUIを単純化
-        fb_params = {
+        self.fb_params_runtime['first'] = {
             'enabled': fb_enabled_first, 'threshold': fb_threshold_first, 'blocks': fb_blocks_first,
             'start': fb_start_first, 'end': fb_end_first, 'max_hits': fb_max_hits_first
         }
-        self.fb_params_runtime = fb_params
+        if fb_use_first_settings:
+            self.fb_params_runtime['hires'] = self.fb_params_runtime['first'].copy()
+            self.fb_params_runtime['hires']['enabled'] = fb_enabled_hires
+        else:
+            self.fb_params_runtime['hires'] = {
+                'enabled': fb_enabled_hires, 'threshold': fb_threshold_hires, 'blocks': fb_blocks_hires,
+                'start': fb_start_hires, 'end': fb_end_hires, 'max_hits': fb_max_hits_hires
+            }
 
-        freeu_params = {
+        self.freeu_params_runtime = {
             'enabled': freeu_enabled, 'b1': freeu_b1, 'b2': freeu_b2, 's1': freeu_s1, 's2': freeu_s2,
             'start_at': freeu_start_at, 'stop_at': freeu_stop_at
         }
-        self.freeu_params_runtime = freeu_params
         
-        is_fb_enabled = fb_params['enabled']
-        is_freeu_enabled = freeu_params['enabled'] and freeu_params['start_at'] < freeu_params['stop_at']
+        is_fb_enabled = self.fb_params_runtime['first']['enabled'] or (self.fb_params_runtime['hires']['enabled'] and getattr(p, 'enable_hr', False))
+        is_freeu_enabled = self.freeu_params_runtime['enabled'] and self.freeu_params_runtime['start_at'] < self.freeu_params_runtime['stop_at']
         
         if not is_fb_enabled and not is_freeu_enabled:
             self.log_debug("Both features disabled, skipping patch.")
@@ -168,7 +196,6 @@ class IntegratedUtilsScript(scripts.Script):
         self.log_info(f"Applying global patch. FBCache: {is_fb_enabled}, FreeU: {is_freeu_enabled}")
         
         try:
-            # ★★★ 修正点: グローバルパッチを適用 ★★★
             self.original_forward = UNetModel.forward
             UNetModel.forward = patched_unet_forward
         except Exception as e:
@@ -180,42 +207,51 @@ class IntegratedUtilsScript(scripts.Script):
     def process_before_every_sampling(self, p, *args, **kwargs):
         if self.original_forward is None: return
 
-        # ★★★ 修正点: ランタイムパラメータをインスタンスに設定 ★★★
         pass_type = "hires" if getattr(p, 'is_hr_pass', False) else "first"
         
-        # FBCache
-        fb_enabled = self.fb_params_runtime.get('enabled', False)
+        fb_params_for_pass = self.fb_params_runtime.get(pass_type, {})
+        fb_enabled = fb_params_for_pass.get('enabled', False)
+        
+        current_params = {
+            'fb_cache_params': {},
+            'freeu_params': self.freeu_params_runtime
+        }
+
         if fb_enabled:
             total_steps = p.hr_second_pass_steps if pass_type == "hires" and p.hr_second_pass_steps > 0 else p.steps
-            self.fb_params_runtime['current_pass_type'] = pass_type
-            self.fb_params_runtime['start_step'] = int(self.fb_params_runtime.get('start', 0.0) * total_steps)
-            self.fb_params_runtime['end_step'] = int(self.fb_params_runtime.get('end', 1.0) * total_steps)
-
-            if self.active_fb_state_object is None:
-                unet_model = self.get_target_unet_model()
-                if unet_model:
-                    self.log_info("Initializing FBCache state for the first time in this generation.")
-                    self.active_fb_state_object = FBCacheState(weakref.ref(unet_model), unet_model.dtype, self.is_debug_logging_enabled)
-            
-            if self.active_fb_state_object:
-                self.active_fb_state_object.check_and_clear_if_critical_params_changed(pass_type, self.fb_params_runtime)
+            current_params['fb_cache_params'] = {
+                'enabled': True, 'current_pass_type': pass_type,
+                'threshold': fb_params_for_pass.get('threshold'), 'num_initial_blocks': fb_params_for_pass.get('blocks'),
+                'start_step': int(fb_params_for_pass.get('start', 0.0) * total_steps),
+                'end_step': int(fb_params_for_pass.get('end', 1.0) * total_steps),
+                'max_hits': int(fb_params_for_pass.get('max_hits')),
+            }
         
-        # FreeU
-        if self.freeu_params_runtime.get('enabled', False):
+        if current_params['freeu_params'].get('enabled', False):
             unet_model = self.get_target_unet_model()
             if unet_model:
                 model_channels = getattr(unet_model, 'model_channels', 320)
-                self.freeu_params_runtime['scale_dict'] = {
-                    model_channels * 4: (self.freeu_params_runtime['b1'], self.freeu_params_runtime['s1']),
-                    model_channels * 2: (self.freeu_params_runtime['b2'], self.freeu_params_runtime['s2'])
+                current_params['freeu_params']['scale_dict'] = {
+                    model_channels * 4: (current_params['freeu_params']['b1'], current_params['freeu_params']['s1']),
+                    model_channels * 2: (current_params['freeu_params']['b2'], current_params['freeu_params']['s2'])
                 }
-                self.freeu_params_runtime['on_cpu_devices_ref'] = {}
+                current_params['freeu_params']['on_cpu_devices_ref'] = {}
+        
+        self.runtime_params_for_patch = current_params
+        
+        if self.active_fb_state_object is None and fb_enabled:
+            unet_model = self.get_target_unet_model()
+            if unet_model:
+                self.log_info("Initializing FBCache state for the first time in this generation.")
+                self.active_fb_state_object = FBCacheState(weakref.ref(unet_model), unet_model.dtype, self.is_debug_logging_enabled)
+        
+        if self.active_fb_state_object and fb_enabled:
+            self.active_fb_state_object.check_and_clear_if_critical_params_changed(pass_type, current_params['fb_cache_params'])
         
         self.log_debug(f"Runtime params updated for {pass_type} pass.")
 
 
     def postprocess(self, p, processed, *args):
-        # ★★★ 修正点: グローバルパッチを確実に戻す ★★★
         if self.original_forward is not None:
             self.log_info("Restoring original UNet forward method.")
             UNetModel.forward = self.original_forward
@@ -245,16 +281,14 @@ class IntegratedUtilsScript(scripts.Script):
 @wraps(UNetModel.forward)
 def patched_unet_forward(self_unet: UNetModel, x: torch.Tensor, timesteps: torch.Tensor, context: torch.Tensor, y=None, control=None, transformer_options:dict =None, **kwargs):
     script_instance = IntegratedUtilsScript._instance
-    # オリジナルの関数を呼び出すための準備
     original_forward = script_instance.original_forward
     
-    # スクリプトが無効な場合はオリジナルを呼び出す
     if not script_instance or not original_forward:
-        # この状況はありえないはずだが、念のため
         return UNetModel.forward(self_unet, x, timesteps, context, y, control, transformer_options, **kwargs)
 
-    fb_params = script_instance.fb_params_runtime
-    freeu_params = script_instance.freeu_params_runtime
+    params = getattr(script_instance, 'runtime_params_for_patch', {})
+    fb_params = params.get('fb_cache_params', {})
+    freeu_params = params.get('freeu_params', {})
     
     is_fb_enabled = fb_params.get('enabled', False)
     is_freeu_enabled = freeu_params.get('enabled', False) and freeu_params.get('start_at', 1.0) < freeu_params.get('stop_at', 0.0)
@@ -262,7 +296,7 @@ def patched_unet_forward(self_unet: UNetModel, x: torch.Tensor, timesteps: torch
     if not is_fb_enabled and not is_freeu_enabled:
         return original_forward(self_unet, x, timesteps, context, y, control, transformer_options, **kwargs)
 
-    # --- 以下、パッチロジック ---
+    # --- 以下、パッチロジック (ほぼ変更なし) ---
     fb_state = script_instance.active_fb_state_object
     is_fbcache_active_for_step = False
     if is_fb_enabled and fb_state:
@@ -280,7 +314,7 @@ def patched_unet_forward(self_unet: UNetModel, x: torch.Tensor, timesteps: torch
     h = x
     current_transformer_options = {} if transformer_options is None else transformer_options.copy()
 
-    num_initial_blocks_for_cache = fb_params.get('blocks', 3) if is_fbcache_active_for_step else 0
+    num_initial_blocks_for_cache = fb_params.get('num_initial_blocks', 3) if is_fbcache_active_for_step else 0
     for block_idx in range(num_initial_blocks_for_cache):
         module_block = self_unet.input_blocks[block_idx]
         h = forward_timestep_embed(module_block, h, emb, context, current_transformer_options, **kwargs)
