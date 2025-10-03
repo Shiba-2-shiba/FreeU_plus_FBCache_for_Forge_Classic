@@ -1,23 +1,24 @@
 # fb_cache_core.py
 #
-# このスクリプトは、First Block Cache (FBCache) のコア機能を提供します。
-# 元の fb_cache_script.py からUI定義やスクリプトイベント処理を分離し、
-# 状態管理クラスとユーティリティ関数のみを抽出したライブラリモジュールです。
-# 統合スクリプト (integrate_utils.py) からインポートして使用されることを想定しています。
+# This script provides the core functionality for the First Block Cache (FBCache).
+# It has been separated from the original UI and script event handling
+# to be used as a library module.
 
 import torch
 import weakref
 import traceback
-from ldm_patched.modules import model_management
 
-# FBCacheの状態を管理するクラス
-# 元のスクリプトからほぼそのまま流用し、ロギング部分を単純なprintに置き換えています。
+# --- Updated Import for Forge ---
+# from ldm_patched.modules import model_management
+from backend import memory_management
+
+# FBCache state management class
 class FBCacheState:
     def __init__(self, unet_instance_ref: weakref.ReferenceType, cache_dtype: torch.dtype, debug_logging: bool = False):
         self.unet_instance_ref = unet_instance_ref
         # cache_data_by_pass_and_batch_size: { "first": {batch_size: cache}, "hires": {batch_size: cache} }
         self.cache_data_by_pass_and_batch_size = {"first": {}, "hires": {}}
-        self.cache_device = model_management.get_torch_device()
+        self.cache_device = memory_management.get_torch_device()
         self.cache_dtype = cache_dtype
         self.is_debug_logging_enabled = debug_logging
         
@@ -150,7 +151,7 @@ class FBCacheState:
         
         self.last_applied_params_by_pass[pass_type] = new_params.copy()
 
-# テンソルの類似度を比較するユーティリティ関数
+# Utility function to compare tensor similarity
 def are_two_tensors_similar(tensor1: torch.Tensor, tensor2: torch.Tensor, threshold: float, current_bs: int, pass_type: str, debug_logging: bool = False) -> bool:
     if tensor1 is None or tensor2 is None:
         if debug_logging: print(f"FBCache Core(Debug): BS {current_bs} ({pass_type}): Similarity check: One or both tensors are None.")
