@@ -2,9 +2,10 @@
 #
 # FBCacheとFreeUを統合し、単一のパッチで両機能を制御するスクリプト。
 #
-# --- v2 Fix ---
-# - Fixed AttributeError by getting the model's dtype from its parameters
-#   (next(diffusion_model.parameters()).dtype) instead of directly from the model object.
+# --- v3 Fix ---
+# - Added sigma-to-timestep conversion inside the patched forward logic.
+#   Forge's backend passes sigma values, but the underlying LDM UNet model
+#   expects integer timesteps for embedding. This fixes the mismatch.
 
 import torch
 import gradio as gr
@@ -24,7 +25,6 @@ try:
     from ldm.modules.diffusionmodules.util import timestep_embedding
 except ImportError:
     print("\n[IntegratedUtils] Error: Could not import LDM modules. This script requires the 'ldm' package.")
-    # Define dummy fallbacks
     class UNetModel: pass
     def forward_timestep_embed(*args, **kwargs): pass
     def apply_control(*args, **kwargs): pass
@@ -78,7 +78,7 @@ class IntegratedUtilsScript(scripts.Script):
     def log_error(self, message: str): print(f"{self._log_prefix()} ERROR: {message}\n{traceback.format_exc()}")
         
     def ui(self, is_img2img):
-        # UI Definition (Same as before)
+        # UI Definition
         ui_components = []
         with gr.Accordion(self.title(), open=False):
             with gr.Row():
@@ -150,7 +150,6 @@ class IntegratedUtilsScript(scripts.Script):
         if is_fb_enabled:
             if self.active_fb_state_object is None:
                 self.log_info("Initializing FBCache state for this generation.")
-                # --- THE FIX v2: Get dtype from model parameters ---
                 model_dtype = next(diffusion_model.parameters()).dtype
                 self.active_fb_state_object = FBCacheState(weakref.ref(diffusion_model), model_dtype, self.is_debug_logging_enabled)
             self.active_fb_state_object.check_and_clear_if_critical_params_changed(pass_type, self.runtime_params_for_patch['fb_cache_params'])
@@ -159,8 +158,10 @@ class IntegratedUtilsScript(scripts.Script):
         original_forward = self.original_forward_method
 
         @wraps(original_forward)
-        def patched_forward_wrapper(self_unet, x, timesteps, context, **kwargs):
-            return patched_unet_forward_logic(self_unet, x, timesteps, context, 
+        def patched_forward_wrapper(x, sigmas, **kwargs):
+            # This wrapper matches the signature from k_model.py: (xc, t, context=...)
+            # where 't' is sigmas.
+            return patched_unet_forward_logic(x=x, sigmas=sigmas, 
                                               script_instance=script_instance, 
                                               original_forward_callable=original_forward, 
                                               **kwargs)
@@ -182,7 +183,7 @@ class IntegratedUtilsScript(scripts.Script):
         return runtime_params
 
     def _restore_original_unet(self, p):
-        if self.original_unet_patcher is not None:
+        if self.original_unet_patcher is not None and hasattr(p, 'sd_model'):
             p.sd_model.forge_objects.unet = self.original_unet_patcher
             self.log_debug("Restored original UNet Patcher.")
             self.original_unet_patcher = None
@@ -204,7 +205,25 @@ class IntegratedUtilsScript(scripts.Script):
         if shared.p: self._restore_original_unet(shared.p)
         if IntegratedUtilsScript._instance == self: IntegratedUtilsScript._instance = None
 
-def patched_unet_forward_logic(self_unet, x, timesteps, context, *, script_instance, original_forward_callable, y=None, control=None, transformer_options:dict=None, **kwargs):
+# --- Main patch logic function ---
+def patched_unet_forward_logic(x, sigmas, *, script_instance, original_forward_callable, **kwargs):
+    # --- THE FIX v3: Convert sigma to timestep ---
+    unet_patcher = script_instance.original_unet_patcher
+    if unet_patcher is None or not hasattr(unet_patcher, 'model') or not hasattr(unet_patcher.model, 'predictor'):
+        # Fallback if predictor is not available
+        return original_forward_callable(x=x, timesteps=sigmas, **kwargs)
+    
+    # Convert the sigma tensor to an integer timestep tensor
+    timesteps = unet_patcher.model.predictor.timestep(sigmas).float()
+
+    # The rest of the arguments are in kwargs: context, control, transformer_options, etc.
+    # We now call the original LDM-style forward function with the correct arguments.
+    self_unet = unet_patcher.model.diffusion_model
+    context = kwargs.get('context')
+    control = kwargs.get('control')
+    transformer_options = kwargs.get('transformer_options')
+    y = kwargs.get('y', None) # y might be passed inside kwargs
+
     params = script_instance.runtime_params_for_patch
     fb_params = params.get('fb_cache_params', {})
     freeu_params = params.get('freeu_params', {})
@@ -212,7 +231,7 @@ def patched_unet_forward_logic(self_unet, x, timesteps, context, *, script_insta
     is_freeu_enabled = freeu_params.get('enabled', False) and freeu_params.get('start_at', 1.0) < freeu_params.get('stop_at', 0.0)
 
     if not is_fb_enabled and not is_freeu_enabled:
-        return original_forward_callable(self_unet, x, timesteps, context=context, y=y, control=control, transformer_options=transformer_options, **kwargs)
+        return original_forward_callable(x, timesteps, context=context, y=y, control=control, transformer_options=transformer_options, **kwargs)
 
     fb_state = script_instance.active_fb_state_object
     is_fbcache_active_for_step = False
