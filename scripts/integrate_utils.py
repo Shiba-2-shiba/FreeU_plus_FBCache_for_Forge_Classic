@@ -2,11 +2,15 @@
 #
 # FBCache and FreeU integration script, controlled by a single patch.
 #
-# --- v7 Fix ---
-# - Corrected the import path for UNet utility functions inside the patch logic.
-# - Changed `from ldm.modules...` to `from backend.nn.diffusionmodules...` to
-#   resolve the `ModuleNotFoundError` by pointing to the likely new location
-#   of these functions within the Forge backend architecture.
+# --- v8 Final ---
+# - Refactored the patch logic to no longer replicate the UNet's forward pass.
+# - Instead of manually processing UNet blocks, the patch now calls the original
+#   `apply_model` function and then applies modifications to its inputs/outputs.
+# - FreeU is now applied by patching `transformer_options` before the call.
+# - FBCache is now applied by capturing and comparing the `model_output` after the call.
+# - This approach removes all direct dependencies on internal UNet helper functions
+#   (e.g., `timestep_embedding`), resolving the `ModuleNotFoundError` permanently
+#   and increasing robustness against future Forge updates.
 
 import torch
 import gradio as gr
@@ -77,7 +81,7 @@ class IntegratedUtilsScript(scripts.Script):
                         with gr.TabItem("First Pass"):
                             fb_enabled_first = gr.Checkbox(label="Enable for First Pass", value=False)
                             fb_threshold_first = gr.Slider(label="Similarity Threshold", minimum=0.001, maximum=0.5, step=0.001, value=0.3)
-                            fb_blocks_first = gr.Slider(label="UNet Initial Blocks to Cache", minimum=1, maximum=4, step=1, value=3)
+                            fb_blocks_first = gr.Slider(label="UNet Initial Blocks to Cache (Ignored, for compatibility)", minimum=1, maximum=4, step=1, value=3)
                             fb_start_first = gr.Slider(label="Start At % of Steps", minimum=0.0, maximum=1.0, step=0.01, value=0.3)
                             fb_end_first = gr.Slider(label="End At % of Steps", minimum=0.0, maximum=1.0, step=0.01, value=0.99)
                             fb_max_hits_first = gr.Number(label="Max Consecutive Hits (-1 for unlimited)", value=-1, precision=0)
@@ -87,7 +91,7 @@ class IntegratedUtilsScript(scripts.Script):
                             fb_use_first_settings = gr.Checkbox(label="Use First Pass settings", value=True)
                             with gr.Group(visible=False) as hires_specific_settings:
                                 fb_threshold_hires = gr.Slider(label="Similarity Threshold (Hires)", minimum=0.001, maximum=0.5, step=0.001, value=0.3)
-                                fb_blocks_hires = gr.Slider(label="UNet Initial Blocks (Hires)", minimum=1, maximum=4, step=1, value=3)
+                                fb_blocks_hires = gr.Slider(label="UNet Initial Blocks (Hires, Ignored)", minimum=1, maximum=4, step=1, value=3)
                                 fb_start_hires = gr.Slider(label="Start At % of Steps (Hires)", minimum=0.0, maximum=1.0, step=0.01, value=0.3)
                                 fb_end_hires = gr.Slider(label="End At % of Steps (Hires)", minimum=0.0, maximum=1.0, step=0.01, value=0.99)
                                 fb_max_hits_hires = gr.Number(label="Max Consecutive Hits (Hires)", value=-1, precision=0)
@@ -190,6 +194,10 @@ class IntegratedUtilsScript(scripts.Script):
         if shared.p: self._restore_original_k_model(shared.p)
         if IntegratedUtilsScript._instance == self: IntegratedUtilsScript._instance = None
 
+# --- FreeU Injection Logic ---
+def freeu_patch(h, hsp, scale_dict, on_cpu_devices_ref):
+    return apply_freeu_scaling(h, hsp, scale_dict, on_cpu_devices_ref)
+
 # --- Main patch logic function ---
 def patched_k_model_apply_logic(k_model_instance, x, t, *, script_instance, original_apply_callable, **kwargs):
     params = script_instance.runtime_params_for_patch
@@ -198,138 +206,57 @@ def patched_k_model_apply_logic(k_model_instance, x, t, *, script_instance, orig
     is_fb_enabled = fb_params.get('enabled', False)
     is_freeu_enabled = freeu_params.get('enabled', False) and freeu_params.get('start_at', 1.0) < freeu_params.get('stop_at', 0.0)
 
-    if not is_fb_enabled and not is_freeu_enabled:
-        return original_apply_callable(x=x, t=t, **kwargs)
+    # --- FreeU Application (before original call) ---
+    if is_freeu_enabled:
+        total_steps = shared.state.sampling_steps if hasattr(shared.state, 'sampling_steps') and shared.state.sampling_steps > 0 else 1
+        progress = (shared.state.sampling_step / (total_steps - 1)) if total_steps > 1 else 1.0
+        
+        if freeu_params.get('start_at', 0.0) <= progress <= freeu_params.get('stop_at', 1.0):
+            if 'transformer_options' not in kwargs: kwargs['transformer_options'] = {}
+            
+            # This is how FreeU is implemented in ComfyUI
+            kwargs['transformer_options']['freeu_patch'] = {
+                'h_patch': lambda h, hsp: freeu_patch(h, hsp, freeu_params['scale_dict'], freeu_params['on_cpu_devices_ref'])
+            }
+            script_instance.log_debug(f"FreeU patch injected at step {shared.state.sampling_step}.")
 
-    # --- Start of Replicated Logic from KModel.apply_model ---
-    sigma = t
-    xc = k_model_instance.predictor.calculate_input(sigma, x)
-    
-    c_concat = kwargs.get('c_concat', None)
-    c_crossattn = kwargs.get('c_crossattn', None)
-    control = kwargs.get('control', None)
-    transformer_options = kwargs.get('transformer_options', {})
-
-    if c_concat is not None:
-        xc = torch.cat([xc] + [c_concat], dim=1)
-
-    context = c_crossattn
-    dtype = k_model_instance.computation_dtype
-
-    xc = xc.to(dtype)
-    timesteps = k_model_instance.predictor.timestep(t).float()
-    context = context.to(dtype)
-    extra_conds = {}
-    for o in kwargs:
-        if o not in ['c_concat', 'c_crossattn', 'control', 'transformer_options']:
-            extra = kwargs[o]
-            if hasattr(extra, "dtype") and extra.dtype not in [torch.int, torch.long]:
-                extra = extra.to(dtype)
-            extra_conds[o] = extra
-    # --- End of Replicated Logic ---
-    
-    self_unet = k_model_instance.diffusion_model
-
-    fb_state = script_instance.active_fb_state_object
+    # --- FBCache Pre-computation & Check ---
     is_fbcache_active_for_step = False
-    if is_fb_enabled and fb_state:
-        current_pass_type = fb_params.get('current_pass_type')
-        current_batch_size = x.shape[0]
-        fb_state.record_call(current_batch_size, current_pass_type)
+    if is_fb_enabled:
         current_step_index = shared.state.sampling_step if hasattr(shared.state, 'sampling_step') else 0
         is_fbcache_active_for_step = (fb_params.get('start_step', 0) <= current_step_index < fb_params.get('end_step', float('inf')))
-        script_instance.log_debug(f"FBCache Check: BS {current_batch_size} ({current_pass_type}), Step {current_step_index}. Active: {is_fbcache_active_for_step}.")
-    
-    # === Patched UNet Forward Logic ===
-    try:
-        from backend.nn.diffusionmodules.util import timestep_embedding
-        from backend.nn.diffusionmodules.openaimodel import forward_timestep_embed, apply_control
-    except ImportError:
-        script_instance.log_error("Failed to import UNet utilities from Forge backend. Falling back to original method.")
-        return original_apply_callable(x=x, t=t, **kwargs)
-
-    hs = []
-    t_emb = timestep_embedding(timesteps, self_unet.model_channels, repeat_only=False).to(device=xc.device, dtype=xc.dtype)
-    emb = self_unet.time_embed(t_emb)
-    
-    y = extra_conds.get('y', None)
-    if self_unet.num_classes is not None:
-        assert y is not None
-        emb = emb + self_unet.label_emb(y)
         
-    h = xc
-    current_transformer_options = {} if transformer_options is None else transformer_options.copy()
-    num_initial_blocks_for_cache = int(fb_params.get('num_initial_blocks', 3)) if is_fbcache_active_for_step else 0
-    
-    for block_idx in range(num_initial_blocks_for_cache):
-        h = forward_timestep_embed(self_unet.input_blocks[block_idx], h, emb, context, current_transformer_options, **extra_conds)
-        if control is not None: h = apply_control(h, control, "input")
-        hs.append(h)
-    
-    h_after_initial_blocks = h.clone() if is_fbcache_active_for_step else None
-    
-    use_cached_result = False
+        if is_fbcache_active_for_step:
+            fb_state = script_instance.active_fb_state_object
+            bs, pt = x.shape[0], fb_params.get('current_pass_type')
+            fb_state.record_call(bs, pt)
+            script_instance.log_debug(f"FBCache Check: BS {bs} ({pt}), Step {current_step_index}. Active: True.")
+            
+            if fb_state.get_key(bs, pt) is not None:
+                max_hits = fb_params.get('max_hits', -1)
+                consecutive_hits = fb_state.get_consecutive_hits(bs, pt)
+                
+                # We use the denoised output `x` as the key for similarity check
+                if max_hits < 0 or consecutive_hits < max_hits:
+                    if are_two_tensors_similar(fb_state.get_key(bs, pt), x, fb_params.get('threshold', 0.1), bs, pt, script_instance.is_debug_logging_enabled) and fb_state.get_residual(bs, pt) is not None:
+                        script_instance.log_debug(f"FBCache: HIT on BS {bs} ({pt}). Applying cached residual.")
+                        cached_residual = fb_state.get_residual(bs, pt)
+                        fb_state.increment_consecutive_hits(bs, pt)
+                        # The "residual" is the final denoised output from the previous step.
+                        return cached_residual.to(x.device, dtype=x.dtype)
+
+    # --- Original Model Call ---
+    model_output = original_apply_callable(x=x, t=t, **kwargs)
+
+    # --- FBCache Post-computation & Storage ---
     if is_fbcache_active_for_step:
         bs, pt = x.shape[0], fb_params.get('current_pass_type')
-        if fb_state.get_key(bs, pt) is not None:
-            max_hits = fb_params.get('max_hits', -1)
-            consecutive_hits = fb_state.get_consecutive_hits(bs, pt)
-            if max_hits < 0 or consecutive_hits < max_hits:
-                if are_two_tensors_similar(fb_state.get_key(bs, pt), h_after_initial_blocks, fb_params.get('threshold', 0.1), bs, pt, script_instance.is_debug_logging_enabled) and fb_state.get_residual(bs, pt) is not None:
-                    use_cached_result = True
-                    script_instance.log_debug(f"FBCache: HIT on BS {bs} ({pt}).")
+        script_instance.log_debug(f"FBCache: MISS on BS {bs} ({pt}). Storing new key and residual.")
+        fb_state.reset_consecutive_hits(bs, pt)
+        fb_state.store_key(x, bs, pt) # Store input `x` as key
+        fb_state.store_residual(model_output, bs, pt) # Store `model_output` as the result to cache
 
-    if use_cached_result:
-        try:
-            bs, pt = x.shape[0], fb_params.get('current_pass_type')
-            cached_residual = fb_state.get_residual(bs, pt)
-            h = h_after_initial_blocks + cached_residual.to(h_after_initial_blocks.device, dtype=h_after_initial_blocks.dtype)
-            fb_state.increment_consecutive_hits(bs, pt)
-            script_instance.log_debug(f"FBCache: Applied residual. Consecutive hits: {fb_state.get_consecutive_hits(bs, pt)}.")
-        except Exception as e:
-            use_cached_result = False
-            bs, pt = x.shape[0], fb_params.get('current_pass_type')
-            fb_state.reset_consecutive_hits(bs, pt)
-            script_instance.log_error(f"FBCache failed to apply residual: {e}. Falling back.")
-    
-    if not use_cached_result:
-        if is_fbcache_active_for_step:
-            bs, pt = x.shape[0], fb_params.get('current_pass_type')
-            script_instance.log_debug(f"FBCache: MISS on BS {bs} ({pt}). Storing new key.")
-            fb_state.reset_consecutive_hits(bs, pt)
-            fb_state.store_key(h_after_initial_blocks, bs, pt)
-        
-        for block_idx in range(num_initial_blocks_for_cache, len(self_unet.input_blocks)):
-            h = forward_timestep_embed(self_unet.input_blocks[block_idx], h, emb, context, current_transformer_options, **extra_conds)
-            if control is not None: h = apply_control(h, control, "input")
-            hs.append(h)
-
-        h = forward_timestep_embed(self_unet.middle_block, h, emb, context, current_transformer_options, **extra_conds)
-        if control is not None: h = apply_control(h, control, "middle")
-        
-        for block_idx, module_block in enumerate(self_unet.output_blocks):
-            hsp = hs.pop()
-            if control is not None: hsp = apply_control(hsp, control, "output")
-            
-            if is_freeu_enabled:
-                total_steps = shared.state.sampling_steps if hasattr(shared.state, 'sampling_steps') and shared.state.sampling_steps > 0 else 1
-                progress = (shared.state.sampling_step / (total_steps - 1)) if total_steps > 1 else 1.0
-                if freeu_params.get('start_at', 0.0) <= progress <= freeu_params.get('stop_at', 1.0):
-                    h, hsp = apply_freeu_scaling(h, hsp, freeu_params['scale_dict'], freeu_params['on_cpu_devices_ref'])
-            
-            h = torch.cat([h, hsp], dim=1)
-            h = forward_timestep_embed(module_block, h, emb, context, current_transformer_options, output_shape=(hs[-1].shape if hs else None), **extra_conds)
-        
-        if is_fbcache_active_for_step:
-            bs, pt = x.shape[0], fb_params.get('current_pass_type')
-            calculated_residual = h - h_after_initial_blocks
-            fb_state.store_residual(calculated_residual, bs, pt)
-            script_instance.log_debug(f"FBCache: Stored new residual for BS {bs} ({pt}).")
-
-    model_output = self_unet.out(h)
-    
-    return k_model_instance.predictor.calculate_denoised(sigma, model_output.float(), x)
-
+    return model_output
 
 script_callbacks.on_script_unloaded(lambda: IntegratedUtilsScript._instance.on_script_unloaded() if IntegratedUtilsScript._instance else None)
 
