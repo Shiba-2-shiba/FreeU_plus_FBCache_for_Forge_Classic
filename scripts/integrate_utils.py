@@ -2,10 +2,9 @@
 #
 # FBCacheとFreeUを統合し、単一のパッチで両機能を制御するスクリプト。
 #
-# --- Final Refactoring for modern sd-webui-forge-classic ---
-# - Fixed TypeError by creating a wrapper function that matches the backend's calling signature.
-# - The wrapper function now correctly handles arguments from k_model.py and calls the original forward method.
-# - Ensured the script instance is captured via closure for the patch to access its parameters.
+# --- v2 Fix ---
+# - Fixed AttributeError by getting the model's dtype from its parameters
+#   (next(diffusion_model.parameters()).dtype) instead of directly from the model object.
 
 import torch
 import gradio as gr
@@ -151,15 +150,14 @@ class IntegratedUtilsScript(scripts.Script):
         if is_fb_enabled:
             if self.active_fb_state_object is None:
                 self.log_info("Initializing FBCache state for this generation.")
-                self.active_fb_state_object = FBCacheState(weakref.ref(diffusion_model), diffusion_model.dtype, self.is_debug_logging_enabled)
+                # --- THE FIX v2: Get dtype from model parameters ---
+                model_dtype = next(diffusion_model.parameters()).dtype
+                self.active_fb_state_object = FBCacheState(weakref.ref(diffusion_model), model_dtype, self.is_debug_logging_enabled)
             self.active_fb_state_object.check_and_clear_if_critical_params_changed(pass_type, self.runtime_params_for_patch['fb_cache_params'])
         
-        # --- THE FIX: Create a wrapper with the correct signature ---
         script_instance = self
         original_forward = self.original_forward_method
 
-        # This wrapper will be the new 'forward' method. Its signature matches the original.
-        # It captures 'script_instance' and 'original_forward' from the local scope (closure).
         @wraps(original_forward)
         def patched_forward_wrapper(self_unet, x, timesteps, context, **kwargs):
             return patched_unet_forward_logic(self_unet, x, timesteps, context, 
@@ -187,9 +185,8 @@ class IntegratedUtilsScript(scripts.Script):
         if self.original_unet_patcher is not None:
             p.sd_model.forge_objects.unet = self.original_unet_patcher
             self.log_debug("Restored original UNet Patcher.")
-            # The forward method is part of the original patcher's model, so it's restored with it.
             self.original_unet_patcher = None
-            self.original_forward_method = None # Clear state
+            self.original_forward_method = None
 
     def postprocess(self, p, processed, *args):
         self.log_info("Restoring original UNet state after generation.")
@@ -207,7 +204,6 @@ class IntegratedUtilsScript(scripts.Script):
         if shared.p: self._restore_original_unet(shared.p)
         if IntegratedUtilsScript._instance == self: IntegratedUtilsScript._instance = None
 
-# --- This function contains the actual patch logic ---
 def patched_unet_forward_logic(self_unet, x, timesteps, context, *, script_instance, original_forward_callable, y=None, control=None, transformer_options:dict=None, **kwargs):
     params = script_instance.runtime_params_for_patch
     fb_params = params.get('fb_cache_params', {})
@@ -218,7 +214,6 @@ def patched_unet_forward_logic(self_unet, x, timesteps, context, *, script_insta
     if not is_fb_enabled and not is_freeu_enabled:
         return original_forward_callable(self_unet, x, timesteps, context=context, y=y, control=control, transformer_options=transformer_options, **kwargs)
 
-    # --- Core Patch Logic ---
     fb_state = script_instance.active_fb_state_object
     is_fbcache_active_for_step = False
     if is_fb_enabled and fb_state:
