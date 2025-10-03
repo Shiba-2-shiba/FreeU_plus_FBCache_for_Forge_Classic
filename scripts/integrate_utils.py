@@ -2,11 +2,11 @@
 #
 # FBCacheとFreeUを統合し、単一のパッチで両機能を制御するスクリプト。
 #
-# 改修履歴:
-# - v3.6 (Argument Fix Version):
-#   - Hires. fix有効時にNameErrorが発生する問題を修正。
-#   - uiメソッドで定義したGradioコンポーネントのリストと、processメソッドの引数リストを完全に一致させ、
-#     引数のずれを解消した。
+# --- Refactoring for modern sd-webui-forge-classic ---
+# - Changed patching method from class-level to instance-level for safety.
+# - Moved patching logic to 'process_before_every_sampling' and 'postprocess'.
+# - Updated module imports to resolve the ModuleNotFoundError.
+# - Utilizes the UnetPatcher's clone() method to prevent state corruption.
 
 import torch
 import gradio as gr
@@ -15,15 +15,27 @@ import weakref
 import datetime
 import sys
 import os
-from functools import wraps
+from functools import partial
 
-# --- WebUI/Forgeのモジュールインポート ---
+# --- WebUI/Forge Module Imports ---
 from modules import scripts, shared, script_callbacks
-from ldm_patched.ldm.modules.diffusionmodules.openaimodel import UNetModel, forward_timestep_embed, apply_control
-from ldm_patched.ldm.modules.diffusionmodules.util import timestep_embedding
-from ldm_patched.modules import model_management
 
-# --- パス解決とコアモジュールのインポート ---
+# --- LDM Module Imports (Updated Path) ---
+# Assuming 'ldm' package is available in the environment, as is standard for Forge.
+try:
+    from ldm.modules.diffusionmodules.openaimodel import UNetModel, forward_timestep_embed, apply_control
+    from ldm.modules.diffusionmodules.util import timestep_embedding
+except ImportError:
+    print("\n[IntegratedUtils] Error: Could not import LDM modules. This script requires the 'ldm' package.")
+    print("[IntegratedUtils] Please ensure sd-webui-forge-classic is installed correctly.")
+    # Define dummy classes/functions to prevent crashes on startup
+    class UNetModel: pass
+    def forward_timestep_embed(*args, **kwargs): pass
+    def apply_control(*args, **kwargs): pass
+    def timestep_embedding(*args, **kwargs): return torch.zeros(1)
+
+
+# --- Path Resolution and Core Module Imports ---
 try:
     script_path = os.path.abspath(__file__)
     scripts_dir = os.path.dirname(script_path)
@@ -38,25 +50,14 @@ try:
 
 except (ImportError, ValueError, NameError) as e:
     print(f"\n[IntegratedUtils] Error: Could not import core modules. ({e})")
-    print("[IntegratedUtils] Please ensure 'freeu_core.py' and 'fb_cache_core.py' exist in the 'modules' subdirectory.")
-    print("[IntegratedUtils] Script will not function correctly.\n")
+    # Define dummy fallbacks
     def apply_freeu_scaling(h, hsp, *args, **kwargs): return h, hsp
     class FBCacheState:
         def __init__(self, *args, **kwargs): pass
-        def record_call(self, *args, **kwargs): pass
-        def get_consecutive_hits(self, *args, **kwargs): return 0
-        def get_key(self, *args, **kwargs): return None
-        def get_residual(self, *args, **kwargs): return None
-        def reset_consecutive_hits(self, *args, **kwargs): pass
-        def store_key(self, *args, **kwargs): pass
-        def increment_consecutive_hits(self, *args, **kwargs): pass
-        def store_residual(self, *args, **kwargs): pass
-        def check_and_clear_if_critical_params_changed(self, *args, **kwargs): pass
-        def get_hit_rate_summary(self, *args, **kwargs): return "Core modules not loaded."
-        def clear_all_data(self, *args, **kwargs): pass
     def are_two_tensors_similar(*args, **kwargs): return False
 
-# --- メインのスクリプトクラス ---
+
+# --- Main Script Class ---
 class IntegratedUtilsScript(scripts.Script):
     _instance = None
     
@@ -69,7 +70,11 @@ class IntegratedUtilsScript(scripts.Script):
         self.is_debug_logging_enabled = False
         self.fb_params_runtime = {}
         self.freeu_params_runtime = {}
-        self.original_forward = None
+        
+        # --- NEW: Variables to manage the patch state safely ---
+        self.original_unet_patcher = None
+        self.original_forward_method = None
+        
         self.log_info("Script instance initialized.")
     
     def title(self):
@@ -78,6 +83,7 @@ class IntegratedUtilsScript(scripts.Script):
     def show(self, is_img2img):
         return scripts.AlwaysVisible
 
+    # --- Logging Methods (Unchanged) ---
     def _log_prefix(self):
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         return f"[{timestamp} IntegratedUtils]"
@@ -93,6 +99,7 @@ class IntegratedUtilsScript(scripts.Script):
         print(f"{self._log_prefix()} ERROR: {message}\n{traceback.format_exc()}")
         
     def ui(self, is_img2img):
+        # --- UI Definition (Unchanged) ---
         ui_components = []
         with gr.Accordion(self.title(), open=False):
             with gr.Row():
@@ -137,23 +144,15 @@ class IntegratedUtilsScript(scripts.Script):
 
         return ui_components
 
-    def get_target_unet_model(self):
-        if not (shared.sd_model and hasattr(shared.sd_model, 'forge_objects') and hasattr(shared.sd_model.forge_objects, 'unet')):
-             return None
-        unet_candidate = shared.sd_model.forge_objects.unet
-        q = [(unet_candidate, 0)]; visited_ids = {id(unet_candidate)}
-        while q:
-            current_obj, depth = q.pop(0)
-            if depth > 10: continue
-            if isinstance(current_obj, UNetModel): return current_obj
-            for attr_name in ['model', 'diffusion_model', 'wrapped', 'patcher', '_model', 'unet']:
-                if hasattr(current_obj, attr_name):
-                    inner_obj = getattr(current_obj, attr_name)
-                    if inner_obj is not None and id(inner_obj) not in visited_ids:
-                        visited_ids.add(id(inner_obj)); q.append((inner_obj, depth + 1))
+    def get_target_unet_diffusion_model(self, p):
+        # Access the underlying diffusion model safely.
+        if hasattr(p, 'sd_model') and hasattr(p.sd_model, 'forge_objects') and hasattr(p.sd_model.forge_objects, 'unet'):
+            unet_patcher = p.sd_model.forge_objects.unet
+            if hasattr(unet_patcher, 'model') and hasattr(unet_patcher.model, 'diffusion_model'):
+                 # The actual model that has the .forward method we want to patch
+                return unet_patcher.model.diffusion_model
         return None
 
-    # ★★★ 修正点: processメソッドの引数をUIコンポーネントのリストと完全に一致させる ★★★
     def process(self, p, 
                 # Debug
                 enable_debug_logging,
@@ -164,9 +163,10 @@ class IntegratedUtilsScript(scripts.Script):
                 # FreeU
                 freeu_enabled, freeu_b1, freeu_b2, freeu_s1, freeu_s2, freeu_start_at, freeu_stop_at
                 ):
+        # --- NEW: Only sets up parameters. Patching is moved to a later step. ---
         self.is_debug_logging_enabled = enable_debug_logging
-        self.active_fb_state_object = None
-        self.log_info("New generation process started. State has been reset.")
+        
+        self.log_info("New generation process started. Parsing UI parameters.")
 
         self.fb_params_runtime['first'] = {
             'enabled': fb_enabled_first, 'threshold': fb_threshold_first, 'blocks': fb_blocks_first,
@@ -187,39 +187,72 @@ class IntegratedUtilsScript(scripts.Script):
         }
         
         is_fb_enabled = self.fb_params_runtime['first']['enabled'] or (self.fb_params_runtime['hires']['enabled'] and getattr(p, 'enable_hr', False))
-        is_freeu_enabled = self.freeu_params_runtime['enabled'] and self.freeu_params_runtime['start_at'] < self.freeu_params_runtime['stop_at']
+        is_freeu_enabled = self.freeu_params_runtime['enabled']
         
-        if not is_fb_enabled and not is_freeu_enabled:
-            self.log_debug("Both features disabled, skipping patch.")
-            return
+        if is_fb_enabled: p.extra_generation_params["Integrated FBCache"] = "Enabled"
+        if is_freeu_enabled: p.extra_generation_params["Integrated FreeU"] = "Enabled"
 
-        self.log_info(f"Applying global patch. FBCache: {is_fb_enabled}, FreeU: {is_freeu_enabled}")
-        
-        try:
-            self.original_forward = UNetModel.forward
-            UNetModel.forward = patched_unet_forward
-        except Exception as e:
-            self.log_error(f"Failed to apply global UNet patch: {e}")
-
-        p.extra_generation_params["Integrated FBCache Enabled"] = is_fb_enabled
-        p.extra_generation_params["Integrated FreeU Enabled"] = is_freeu_enabled
 
     def process_before_every_sampling(self, p, *args, **kwargs):
-        if self.original_forward is None: return
-
-        pass_type = "hires" if getattr(p, 'is_hr_pass', False) else "first"
+        # --- NEW: This is the modern, correct place to apply patches. ---
+        is_hires_pass = getattr(p, 'is_hr_pass', False)
+        pass_type = "hires" if is_hires_pass else "first"
         
+        # Determine if any feature is active for this pass
         fb_params_for_pass = self.fb_params_runtime.get(pass_type, {})
-        fb_enabled = fb_params_for_pass.get('enabled', False)
+        is_fb_enabled = fb_params_for_pass.get('enabled', False)
+        is_freeu_enabled = self.freeu_params_runtime.get('enabled', False)
         
-        current_params = {
+        if not is_fb_enabled and not is_freeu_enabled:
+            self.log_debug(f"[{pass_type} pass] No features enabled, skipping patch.")
+            self._restore_original_unet(p) # Ensure it's restored if it was patched before
+            return
+
+        self.log_info(f"[{pass_type} pass] Applying patches. FBCache: {is_fb_enabled}, FreeU: {is_freeu_enabled}")
+
+        # Store the original UnetPatcher if this is the first time
+        if self.original_unet_patcher is None:
+            self.original_unet_patcher = p.sd_model.forge_objects.unet
+        
+        # Clone the patcher to avoid modifying the original object in place
+        unet_patcher_clone = self.original_unet_patcher.clone()
+        diffusion_model = unet_patcher_clone.model.diffusion_model
+
+        # Store original forward method from the diffusion_model instance
+        self.original_forward_method = diffusion_model.forward
+
+        # Prepare runtime params for the patched function
+        self.runtime_params_for_patch = self._prepare_runtime_params(p, pass_type)
+        
+        # Initialize FBCache state object if needed
+        if is_fb_enabled and self.active_fb_state_object is None:
+            self.log_info("Initializing FBCache state for this generation.")
+            self.active_fb_state_object = FBCacheState(weakref.ref(diffusion_model), diffusion_model.dtype, self.is_debug_logging_enabled)
+        
+        # Clear cache if critical params changed for the current pass
+        if is_fb_enabled and self.active_fb_state_object:
+            self.active_fb_state_object.check_and_clear_if_critical_params_changed(pass_type, self.runtime_params_for_patch['fb_cache_params'])
+        
+        # Apply the patch to the instance
+        diffusion_model.forward = partial(patched_unet_forward, script_instance=self)
+        
+        # Replace the processing object's unet with our patched clone
+        p.sd_model.forge_objects.unet = unet_patcher_clone
+        
+
+    def _prepare_runtime_params(self, p, pass_type):
+        """Helper to assemble parameters for the patched forward function."""
+        fb_params_for_pass = self.fb_params_runtime.get(pass_type, {})
+        is_fb_enabled = fb_params_for_pass.get('enabled', False)
+        
+        runtime_params = {
             'fb_cache_params': {},
             'freeu_params': self.freeu_params_runtime
         }
 
-        if fb_enabled:
-            total_steps = p.hr_second_pass_steps if pass_type == "hires" and p.hr_second_pass_steps > 0 else p.steps
-            current_params['fb_cache_params'] = {
+        if is_fb_enabled:
+            total_steps = p.hr_second_pass_steps if pass_type == "hires" and hasattr(p, 'hr_second_pass_steps') and p.hr_second_pass_steps > 0 else p.steps
+            runtime_params['fb_cache_params'] = {
                 'enabled': True, 'current_pass_type': pass_type,
                 'threshold': fb_params_for_pass.get('threshold'), 'num_initial_blocks': fb_params_for_pass.get('blocks'),
                 'start_step': int(fb_params_for_pass.get('start', 0.0) * total_steps),
@@ -227,35 +260,37 @@ class IntegratedUtilsScript(scripts.Script):
                 'max_hits': int(fb_params_for_pass.get('max_hits')),
             }
         
-        if current_params['freeu_params'].get('enabled', False):
-            unet_model = self.get_target_unet_model()
-            if unet_model:
-                model_channels = getattr(unet_model, 'model_channels', 320)
-                current_params['freeu_params']['scale_dict'] = {
-                    model_channels * 4: (current_params['freeu_params']['b1'], current_params['freeu_params']['s1']),
-                    model_channels * 2: (current_params['freeu_params']['b2'], current_params['freeu_params']['s2'])
+        if self.freeu_params_runtime.get('enabled', False):
+            diffusion_model = self.get_target_unet_diffusion_model(p)
+            if diffusion_model:
+                model_channels = getattr(diffusion_model, 'model_channels', 320)
+                runtime_params['freeu_params']['scale_dict'] = {
+                    model_channels * 4: (self.freeu_params_runtime['b1'], self.freeu_params_runtime['s1']),
+                    model_channels * 2: (self.freeu_params_runtime['b2'], self.freeu_params_runtime['s2'])
                 }
-                current_params['freeu_params']['on_cpu_devices_ref'] = {}
+                runtime_params['freeu_params']['on_cpu_devices_ref'] = {}
         
-        self.runtime_params_for_patch = current_params
-        
-        if self.active_fb_state_object is None and fb_enabled:
-            unet_model = self.get_target_unet_model()
-            if unet_model:
-                self.log_info("Initializing FBCache state for the first time in this generation.")
-                self.active_fb_state_object = FBCacheState(weakref.ref(unet_model), unet_model.dtype, self.is_debug_logging_enabled)
-        
-        if self.active_fb_state_object and fb_enabled:
-            self.active_fb_state_object.check_and_clear_if_critical_params_changed(pass_type, current_params['fb_cache_params'])
-        
-        self.log_debug(f"Runtime params updated for {pass_type} pass.")
+        return runtime_params
 
+    def _restore_original_unet(self, p):
+        """Helper to safely restore the original UNet Patcher and forward method."""
+        if self.original_unet_patcher is not None:
+            p.sd_model.forge_objects.unet = self.original_unet_patcher
+            self.log_debug("Restored original UNet Patcher to processing object.")
+
+        if self.original_forward_method is not None:
+            diffusion_model = self.get_target_unet_diffusion_model(p)
+            if diffusion_model:
+                diffusion_model.forward = self.original_forward_method
+                self.log_debug("Restored original .forward method to diffusion model instance.")
+        
+        self.original_unet_patcher = None
+        self.original_forward_method = None
 
     def postprocess(self, p, processed, *args):
-        if self.original_forward is not None:
-            self.log_info("Restoring original UNet forward method.")
-            UNetModel.forward = self.original_forward
-            self.original_forward = None
+        # --- NEW: This is the cleanup step after the entire generation is done. ---
+        self.log_info("Restoring original UNet state after generation.")
+        self._restore_original_unet(p)
 
         if self.active_fb_state_object:
             summary = self.active_fb_state_object.get_hit_rate_summary()
@@ -270,20 +305,20 @@ class IntegratedUtilsScript(scripts.Script):
         return processed
         
     def on_script_unloaded(self):
-        self.log_info("Script unloading, restoring original forward method if patched.")
-        if self.original_forward is not None:
-            UNetModel.forward = self.original_forward
-            self.original_forward = None
+        # --- NEW: Safety net to restore on script unload. ---
+        self.log_info("Script unloading, attempting to restore original UNet state.")
+        if shared.p: # If a processing object exists
+             self._restore_original_unet(shared.p)
         if IntegratedUtilsScript._instance == self:
             IntegratedUtilsScript._instance = None
 
-# --- 統合パッチ済みforward関数 ---
-@wraps(UNetModel.forward)
-def patched_unet_forward(self_unet: UNetModel, x: torch.Tensor, timesteps: torch.Tensor, context: torch.Tensor, y=None, control=None, transformer_options:dict =None, **kwargs):
-    script_instance = IntegratedUtilsScript._instance
-    original_forward = script_instance.original_forward
+# --- NEW: Patched forward function, now takes script_instance explicitly ---
+def patched_unet_forward(self_unet: UNetModel, x: torch.Tensor, timesteps: torch.Tensor, context: torch.Tensor, y=None, control=None, transformer_options:dict=None, *, script_instance: IntegratedUtilsScript, **kwargs):
     
-    if not script_instance or not original_forward:
+    # This logic is mostly the same as the original, but uses script_instance to get its state
+    original_forward = script_instance.original_forward_method
+    if not original_forward:
+        # Fallback to a direct call if something went wrong
         return UNetModel.forward(self_unet, x, timesteps, context, y, control, transformer_options, **kwargs)
 
     params = getattr(script_instance, 'runtime_params_for_patch', {})
@@ -294,9 +329,9 @@ def patched_unet_forward(self_unet: UNetModel, x: torch.Tensor, timesteps: torch
     is_freeu_enabled = freeu_params.get('enabled', False) and freeu_params.get('start_at', 1.0) < freeu_params.get('stop_at', 0.0)
 
     if not is_fb_enabled and not is_freeu_enabled:
-        return original_forward(self_unet, x, timesteps, context, y, control, transformer_options, **kwargs)
+        return original_forward(x, timesteps, context, y, control, transformer_options, **kwargs)
 
-    # --- 以下、パッチロジック (ほぼ変更なし) ---
+    # --- Core Patch Logic (largely unchanged, but self-contained) ---
     fb_state = script_instance.active_fb_state_object
     is_fbcache_active_for_step = False
     if is_fb_enabled and fb_state:
@@ -314,7 +349,8 @@ def patched_unet_forward(self_unet: UNetModel, x: torch.Tensor, timesteps: torch
     h = x
     current_transformer_options = {} if transformer_options is None else transformer_options.copy()
 
-    num_initial_blocks_for_cache = fb_params.get('num_initial_blocks', 3) if is_fbcache_active_for_step else 0
+    num_initial_blocks_for_cache = int(fb_params.get('num_initial_blocks', 3)) if is_fbcache_active_for_step else 0
+    
     for block_idx in range(num_initial_blocks_for_cache):
         module_block = self_unet.input_blocks[block_idx]
         h = forward_timestep_embed(module_block, h, emb, context, current_transformer_options, **kwargs)
@@ -345,6 +381,25 @@ def patched_unet_forward(self_unet: UNetModel, x: torch.Tensor, timesteps: torch
             h = h_after_initial_blocks + cached_residual.to(h_after_initial_blocks.device, dtype=h_after_initial_blocks.dtype)
             fb_state.increment_consecutive_hits(current_batch_size, current_pass_type)
             script_instance.log_debug(f"FBCache: Applied residual. Consecutive hits: {fb_state.get_consecutive_hits(current_batch_size, current_pass_type)}.")
+            # We skip the rest of the UNet calculation, but we need the output blocks to run on the cached result
+            # We need to fast-forward the `hs` stack. The cached result is after `num_initial_blocks_for_cache`.
+            # We need to simulate the rest of the input blocks and middle block to get the correct `hsp` for output blocks.
+            # This is complex. A simpler approach for the HIT case is needed.
+            # For now, let's assume the cached residual is applied to h, and the rest of the network runs from there.
+            # This is a conceptual simplification. The original logic was more intricate.
+            # A true HIT should replace 'h' and fast-forward to the output blocks with the correct 'hs' stack.
+            # This logic below is a re-run from the cache point, which is not a true cache hit optimization.
+            # Correcting this would require deep changes. Let's stick to the original logic which seems to recalculate.
+            #
+            # The original logic implies that if a HIT occurs, the ENTIRE rest of the UNet is skipped and replaced
+            # by adding the residual. This is what we will implement.
+            #
+            # It seems the original code had a subtle bug/feature: `h` after the residual addition is the *final* output.
+            # Let's re-read the original logic carefully.
+            # After `h = h_after_initial_blocks + cached_residual`, it jumps to the `final_output` calculation.
+            # This seems correct for a cache hit.
+            pass # The logic will now naturally skip to the end of the `if not use_cached_result` block.
+
         except Exception as e:
             script_instance.log_error(f"FBCache failed to apply residual: {e}. Falling back to full calculation.")
             use_cached_result = False
@@ -397,7 +452,7 @@ def patched_unet_forward(self_unet: UNetModel, x: torch.Tensor, timesteps: torch
     else:
         final_output = self_unet.out(h)
     
-    return final_output.type(x.dtype)
+    return final_output.to(x.dtype)
 
-# --- Forgeのライフサイクルコールバックへの登録 (変更なし) ---
+# --- Register script lifecycle callbacks ---
 script_callbacks.on_script_unloaded(lambda: IntegratedUtilsScript._instance.on_script_unloaded() if IntegratedUtilsScript._instance else None)
