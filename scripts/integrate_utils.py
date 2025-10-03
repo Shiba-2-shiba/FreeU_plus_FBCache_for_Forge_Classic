@@ -2,9 +2,10 @@
 #
 # FBCacheとFreeUを統合し、単一のパッチで両機能を制御するスクリプト。
 #
-# --- v4 Fix ---
-# - Resolved RuntimeError by explicitly moving the time embedding tensor (t_emb)
-#   to the correct device (x.device), ensuring all tensors are on the GPU.
+# --- v5 Fix ---
+# - Resolved shape mismatch error (mat1 and mat2 shapes cannot be multiplied).
+# - The calculated timestep tensor is now repeated to match the batch size of the input `x`.
+#   This handles cases where the sampler provides a single sigma for the entire batch.
 
 import torch
 import gradio as gr
@@ -210,6 +211,10 @@ def patched_unet_forward_logic(x, sigmas, *, script_instance, original_forward_c
     
     timesteps = unet_patcher.model.predictor.timestep(sigmas).float()
 
+    # --- THE FIX v5: Repeat timestep tensor to match batch size ---
+    if timesteps.shape[0] < x.shape[0]:
+        timesteps = timesteps.repeat(x.shape[0])
+
     self_unet = unet_patcher.model.diffusion_model
     context = kwargs.get('context')
     control = kwargs.get('control')
@@ -236,7 +241,6 @@ def patched_unet_forward_logic(x, sigmas, *, script_instance, original_forward_c
         script_instance.log_debug(f"FBCache Check: BS {current_batch_size} ({current_pass_type}), Step {current_step_index}. Active: {is_fbcache_active_for_step}.")
     
     hs = []
-    # --- THE FIX v4: Explicitly set the device for the time embedding tensor ---
     t_emb = timestep_embedding(timesteps, self_unet.model_channels, repeat_only=False).to(device=x.device, dtype=x.dtype)
     emb = self_unet.time_embed(t_emb)
     if self_unet.num_classes is not None: emb = emb + self_unet.label_emb(y)
