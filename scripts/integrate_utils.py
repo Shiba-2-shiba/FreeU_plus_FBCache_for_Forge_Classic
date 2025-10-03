@@ -2,14 +2,11 @@
 #
 # FBCache and FreeU integration script, controlled by a single patch.
 #
-# --- v6 Fix ---
-# - Changed the patch target from `diffusion_model.forward` to `KModel.apply_model`.
-#   This aligns with the Forge backend architecture, ensuring compatibility with
-#   ControlNet and other built-in features by operating within the expected data flow.
-# - The wrapper function signature now matches `apply_model(x, t, **kwargs)`,
-#   eliminating the need to recalculate timesteps from sigmas.
-# - Removed unnecessary imports from `ldm.modules` as the patch no longer
-#   replicates the internal logic of the UNet's forward pass.
+# --- v7 Fix ---
+# - Corrected the import path for UNet utility functions inside the patch logic.
+# - Changed `from ldm.modules...` to `from backend.nn.diffusionmodules...` to
+#   resolve the `ModuleNotFoundError` by pointing to the likely new location
+#   of these functions within the Forge backend architecture.
 
 import torch
 import gradio as gr
@@ -155,7 +152,6 @@ class IntegratedUtilsScript(scripts.Script):
                                                **kwargs)
 
         k_model_instance.apply_model = patched_apply_model_wrapper
-        # No need to re-assign the model to p.sd_model, as we are patching in-place.
 
     def _prepare_runtime_params(self, p, pass_type):
         fb_params_for_pass = self.fb_params_runtime.get(pass_type, {})
@@ -172,10 +168,11 @@ class IntegratedUtilsScript(scripts.Script):
 
     def _restore_original_k_model(self, p):
         if self.original_k_model is not None and hasattr(p, 'sd_model'):
-            self.original_k_model.apply_model = self.original_apply_model_method
-            self.log_debug("Restored original K-Model apply_model method.")
-            self.original_k_model = None
-            self.original_apply_model_method = None
+            if hasattr(self.original_k_model, 'apply_model'):
+                self.original_k_model.apply_model = self.original_apply_model_method
+                self.log_debug("Restored original K-Model apply_model method.")
+        self.original_k_model = None
+        self.original_apply_model_method = None
 
     def postprocess(self, p, processed, *args):
         self.log_info("Restoring original K-Model state after generation.")
@@ -201,7 +198,6 @@ def patched_k_model_apply_logic(k_model_instance, x, t, *, script_instance, orig
     is_fb_enabled = fb_params.get('enabled', False)
     is_freeu_enabled = freeu_params.get('enabled', False) and freeu_params.get('start_at', 1.0) < freeu_params.get('stop_at', 0.0)
 
-    # If both features are disabled, just call the original method.
     if not is_fb_enabled and not is_freeu_enabled:
         return original_apply_callable(x=x, t=t, **kwargs)
 
@@ -225,18 +221,15 @@ def patched_k_model_apply_logic(k_model_instance, x, t, *, script_instance, orig
     context = context.to(dtype)
     extra_conds = {}
     for o in kwargs:
-        # Exclude already processed kwargs
         if o not in ['c_concat', 'c_crossattn', 'control', 'transformer_options']:
             extra = kwargs[o]
-            if hasattr(extra, "dtype"):
-                if extra.dtype != torch.int and extra.dtype != torch.long:
-                    extra = extra.to(dtype)
+            if hasattr(extra, "dtype") and extra.dtype not in [torch.int, torch.long]:
+                extra = extra.to(dtype)
             extra_conds[o] = extra
     # --- End of Replicated Logic ---
     
     self_unet = k_model_instance.diffusion_model
 
-    # Check FBCache activity for the current step
     fb_state = script_instance.active_fb_state_object
     is_fbcache_active_for_step = False
     if is_fb_enabled and fb_state:
@@ -247,13 +240,14 @@ def patched_k_model_apply_logic(k_model_instance, x, t, *, script_instance, orig
         is_fbcache_active_for_step = (fb_params.get('start_step', 0) <= current_step_index < fb_params.get('end_step', float('inf')))
         script_instance.log_debug(f"FBCache Check: BS {current_batch_size} ({current_pass_type}), Step {current_step_index}. Active: {is_fbcache_active_for_step}.")
     
-    # === Patched UNet Forward Logic (Simplified and adapted for apply_model) ===
-    # This section replaces the direct call to `self.diffusion_model(...)`
-    # It's a simplified version of ComfyUI's UNetModel.forward
-    
-    from ldm.modules.diffusionmodules.util import timestep_embedding
-    from ldm.modules.diffusionmodules.openaimodel import forward_timestep_embed, apply_control
-    
+    # === Patched UNet Forward Logic ===
+    try:
+        from backend.nn.diffusionmodules.util import timestep_embedding
+        from backend.nn.diffusionmodules.openaimodel import forward_timestep_embed, apply_control
+    except ImportError:
+        script_instance.log_error("Failed to import UNet utilities from Forge backend. Falling back to original method.")
+        return original_apply_callable(x=x, t=t, **kwargs)
+
     hs = []
     t_emb = timestep_embedding(timesteps, self_unet.model_channels, repeat_only=False).to(device=xc.device, dtype=xc.dtype)
     emb = self_unet.time_embed(t_emb)
@@ -334,8 +328,8 @@ def patched_k_model_apply_logic(k_model_instance, x, t, *, script_instance, orig
 
     model_output = self_unet.out(h)
     
-    # Final step: denoise the output as KModel does
     return k_model_instance.predictor.calculate_denoised(sigma, model_output.float(), x)
 
 
 script_callbacks.on_script_unloaded(lambda: IntegratedUtilsScript._instance.on_script_unloaded() if IntegratedUtilsScript._instance else None)
+
