@@ -2,10 +2,9 @@
 #
 # FBCacheとFreeUを統合し、単一のパッチで両機能を制御するスクリプト。
 #
-# --- v3 Fix ---
-# - Added sigma-to-timestep conversion inside the patched forward logic.
-#   Forge's backend passes sigma values, but the underlying LDM UNet model
-#   expects integer timesteps for embedding. This fixes the mismatch.
+# --- v4 Fix ---
+# - Resolved RuntimeError by explicitly moving the time embedding tensor (t_emb)
+#   to the correct device (x.device), ensuring all tensors are on the GPU.
 
 import torch
 import gradio as gr
@@ -159,8 +158,6 @@ class IntegratedUtilsScript(scripts.Script):
 
         @wraps(original_forward)
         def patched_forward_wrapper(x, sigmas, **kwargs):
-            # This wrapper matches the signature from k_model.py: (xc, t, context=...)
-            # where 't' is sigmas.
             return patched_unet_forward_logic(x=x, sigmas=sigmas, 
                                               script_instance=script_instance, 
                                               original_forward_callable=original_forward, 
@@ -207,22 +204,17 @@ class IntegratedUtilsScript(scripts.Script):
 
 # --- Main patch logic function ---
 def patched_unet_forward_logic(x, sigmas, *, script_instance, original_forward_callable, **kwargs):
-    # --- THE FIX v3: Convert sigma to timestep ---
     unet_patcher = script_instance.original_unet_patcher
     if unet_patcher is None or not hasattr(unet_patcher, 'model') or not hasattr(unet_patcher.model, 'predictor'):
-        # Fallback if predictor is not available
         return original_forward_callable(x=x, timesteps=sigmas, **kwargs)
     
-    # Convert the sigma tensor to an integer timestep tensor
     timesteps = unet_patcher.model.predictor.timestep(sigmas).float()
 
-    # The rest of the arguments are in kwargs: context, control, transformer_options, etc.
-    # We now call the original LDM-style forward function with the correct arguments.
     self_unet = unet_patcher.model.diffusion_model
     context = kwargs.get('context')
     control = kwargs.get('control')
     transformer_options = kwargs.get('transformer_options')
-    y = kwargs.get('y', None) # y might be passed inside kwargs
+    y = kwargs.get('y', None)
 
     params = script_instance.runtime_params_for_patch
     fb_params = params.get('fb_cache_params', {})
@@ -244,7 +236,8 @@ def patched_unet_forward_logic(x, sigmas, *, script_instance, original_forward_c
         script_instance.log_debug(f"FBCache Check: BS {current_batch_size} ({current_pass_type}), Step {current_step_index}. Active: {is_fbcache_active_for_step}.")
     
     hs = []
-    t_emb = timestep_embedding(timesteps, self_unet.model_channels, repeat_only=False).to(x.dtype)
+    # --- THE FIX v4: Explicitly set the device for the time embedding tensor ---
+    t_emb = timestep_embedding(timesteps, self_unet.model_channels, repeat_only=False).to(device=x.device, dtype=x.dtype)
     emb = self_unet.time_embed(t_emb)
     if self_unet.num_classes is not None: emb = emb + self_unet.label_emb(y)
     h = x
